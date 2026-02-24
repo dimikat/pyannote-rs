@@ -48,10 +48,36 @@ pub fn get_segments<P: AsRef<Path>>(
     };
 
     let mut start_iter = (0..padded_samples.len()).step_by(window_size);
+    let mut exhausted = false;
 
     let mut segments_queue = VecDeque::new();
     Ok(std::iter::from_fn(move || {
-        if let Some(start) = start_iter.next() {
+        // Keep processing windows until we have a segment to return or all windows are exhausted
+        while segments_queue.is_empty() && !exhausted {
+            let Some(start) = start_iter.next() else {
+                // No more windows — flush any in-progress speech segment
+                if is_speeching {
+                    let seg_start = start_offset / sample_rate as f64;
+                    let seg_end = offset as f64 / sample_rate as f64;
+
+                    let start_idx =
+                        (seg_start * sample_rate as f64).min((samples.len() - 1) as f64) as usize;
+                    let end_idx =
+                        (seg_end * sample_rate as f64).min(samples.len() as f64) as usize;
+
+                    let segment_samples = &padded_samples[start_idx..end_idx];
+                    is_speeching = false;
+
+                    segments_queue.push_back(Segment {
+                        start: seg_start,
+                        end: seg_end,
+                        samples: segment_samples.to_vec(),
+                    });
+                }
+                exhausted = true;
+                break;
+            };
+
             let end = (start + window_size).min(padded_samples.len());
             let window = &padded_samples[start..end];
 
@@ -60,9 +86,13 @@ pub fn get_segments<P: AsRef<Path>>(
             let array = array.view().insert_axis(Axis(0)).insert_axis(Axis(1));
 
             // Handle potential errors during the session and input processing
-            let inputs = ort::inputs![ort::value::TensorRef::from_array_view(array.into_dyn())
-                .map_err(|e| eyre::eyre!("Failed to prepare inputs: {:?}", e))
-                .ok()?];
+            let tensor_ref = match ort::value::TensorRef::from_array_view(array.into_dyn()) {
+                Ok(t) => t,
+                Err(e) => {
+                    return Some(Err(eyre::eyre!("Failed to prepare inputs: {:?}", e)));
+                }
+            };
+            let inputs = ort::inputs![tensor_ref];
 
             let ort_outs = match session.run(inputs) {
                 Ok(outputs) => outputs,
@@ -82,8 +112,7 @@ pub fn get_segments<P: AsRef<Path>>(
                 Err(e) => return Some(Err(eyre::eyre!("Tensor extraction error: {:?}", e))),
             };
 
-            let (shape, data) = ort_out; // (&Shape, &[f32])
-                                         // Fix: shape is &Shape, but from_shape expects &[usize]
+            let (shape, data) = ort_out;
             let shape_slice: Vec<usize> = (0..shape.len()).map(|i| shape[i] as usize).collect();
             let view =
                 ndarray::ArrayViewD::<f32>::from_shape(ndarray::IxDyn(&shape_slice), data).unwrap();
@@ -115,12 +144,11 @@ pub fn get_segments<P: AsRef<Path>>(
 
                         is_speeching = false;
 
-                        let segment = Segment {
+                        segments_queue.push_back(Segment {
                             start,
                             end,
                             samples: segment_samples.to_vec(),
-                        };
-                        segments_queue.push_back(segment);
+                        });
                     }
                     offset += frame_size;
                 }
